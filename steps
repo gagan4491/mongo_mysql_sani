@@ -1,0 +1,35 @@
+systemctl stop mongod
+rm -rf /var/lib/mongodb/*
+
+rsync -aH --info=progress2 \
+  /mongo/dump_mongodb/ \
+  /var/lib/mongodb/
+
+chown -R mongod:mongod /var/lib/mongodb
+chmod 750 /var/lib/mongodb
+
+
+
+systemctl start mongod
+systemctl status mongod --no-pager
+tail -n 80 /var/log/mongodb/mongod.log
+
+
+mongo
+
+(var localDB = db.getSiblingDB("local");
+
+localDB.replset.minvalid.drop();
+localDB.replset.oplogTruncateAfterPoint.drop();
+localDB.replset.election.drop();
+
+localDB.system.replset.remove({});
+localDB.system.replset_backup.drop();
+
+// No longer required by a standalone server and may contain production data.
+localDB.oplog.rs.drop();
+
+print("Replica configurations remaining: " +
+      localDB.system.replset.find().count()); )
+
+

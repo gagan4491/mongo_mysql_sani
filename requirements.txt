@@ -1,0 +1,2 @@
+# bson is included with pymongo; do not install the separate bson package.
+pymongo>=4.6,<5
