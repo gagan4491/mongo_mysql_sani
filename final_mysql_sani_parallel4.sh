@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Change only this value: maximum independent table workers per phase.
+# The aperture email table uses this many ID-range workers on its own.
+SANITIZE_MAX_PAR=8
+
 export PATH=/usr/lib/jvm/jdk-21.0.7-oracle-x64/bin/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 MYSQL_DATA_DIR=/var/lib/mysql/alertdriving
@@ -22,11 +26,11 @@ USERS_PERMS_SQL=${DESTINATION}/database_users_permissions.sql
 
 me=$(basename "$0")
 filename="${me%.*}"
-LOG_DIR=/root
+LOG_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 Logfile=${LOG_DIR}/${filename}.log
-ERROR_LOG=${LOG_DIR}/${filename}_errors.log
-XTRABACKUP_BACKUP_LOG=${LOG_DIR}/xtrabackup_backup.log
-XTRABACKUP_PREPARE_LOG=${LOG_DIR}/xtrabackup_prepare.log
+ERROR_LOG="${Logfile}"
+XTRABACKUP_BACKUP_LOG="${Logfile}"
+XTRABACKUP_PREPARE_LOG="${Logfile}"
 
 MD5_TMP=/opt/mysql-files-md5.txt
 MD5_TMP_CLEANED=/opt/mysql-files-md5_paths_removed.txt
@@ -186,11 +190,17 @@ XTRABACKUP_DECOMPRESS_PAR=12
 XTRABACKUP_BACKUP_PAR=4
 XTRABACKUP_OPEN_FILES_LIMIT=65535
 ARCHIVE_PAR=4
-EMAIL_SANI_MAX_PAR=4 # aperture_email_log.email only; other work stays sequential
 
 DELETE_SOURCE_BACKUP=0
 
 set -uo pipefail
+
+if [[ ! "${SANITIZE_MAX_PAR}" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]]; then
+    echo "SANITIZE_MAX_PAR must be an integer from 1 through 64" >&2
+    exit 1
+fi
+
+EMAIL_SANI_MAX_PAR="${SANITIZE_MAX_PAR}"
 
 # One coordinator per host, regardless of filename or RUN_MODE. The original
 # script does not take this lock: verify it has finished before deploying.
@@ -199,6 +209,7 @@ command -v flock >/dev/null 2>&1 || { echo "flock is required" >&2; exit 1; }
 exec 9>/var/lock/mysql-sanitization.lock || exit 1
 flock -n 9 || { echo "Another sanitization coordinator/workers hold the lock" >&2; exit 1; }
 EMAIL_WORKER_PIDS=()
+TABLE_WORKER_PIDS=()
 
 
 # Keep long-running work alive if the launching SSH terminal disconnects.
@@ -221,11 +232,11 @@ esac
 ulimit -n "${XTRABACKUP_OPEN_FILES_LIMIT}" || true
 
 log() {
-	echo "$(date) - $*" | tee -a "$Logfile"
+	echo "$(date) - [${SANI_LOG_CONTEXT:-main}] $*" | tee -a "$Logfile"
 }
 
 ERRORmsg() {
-	echo "$(date) - ERROR: $*" | tee -a "$Logfile" "$ERROR_LOG"
+	echo "$(date) - [${SANI_LOG_CONTEXT:-main}] ERROR: $*" | tee -a "$Logfile"
 }
 
 REPORT_TOTAL_ELAPSED() {
@@ -236,10 +247,11 @@ REPORT_TOTAL_ELAPSED() {
 	# Workers ignore INT/TERM and drain normally; this can take a long time.
 	trap '' INT TERM
 	local worker_pid
-	for worker_pid in "${EMAIL_WORKER_PIDS[@]}"; do
+	for worker_pid in ${TABLE_WORKER_PIDS[@]+"${TABLE_WORKER_PIDS[@]}"} ${EMAIL_WORKER_PIDS[@]+"${EMAIL_WORKER_PIDS[@]}"}; do
 		wait "${worker_pid}" || rc=1
 	done
 	EMAIL_WORKER_PIDS=()
+	TABLE_WORKER_PIDS=()
 	if [ "${APERTURE_INDEXES_TEMPORARILY_REMOVED}" -eq 1 ]; then
 		ERRORmsg "Exit detected while aperture secondary indexes may be absent; attempting repair"
 		if ! RESTORE_APERTURE_EMAIL_SECONDARY_INDEXES; then
@@ -777,7 +789,7 @@ SANITIZE_TEXT_COLUMN_IN_BATCHES() {
 	local max_length="$4"
 	local value_type="$5"
 	local batch_size="${PII_SANI_BATCH_SIZE}"
-	local helper_table="__pii_sani_map_$$"
+	local helper_table="__pii_sani_map_${BASHPID}"
 	local output
 	local affected
 	local total=0
@@ -891,7 +903,7 @@ SANITIZE_TEXT_COLUMN_IN_BATCHES() {
 	return 0
 }
 
-SANITIZE_PERSONAL_DATA() {
+SANITIZE_PERSONAL_DATA_ONE_TABLE() {
 	log "Sanitizing first names, last names, addresses, and phone numbers..."
 
 	local hash_cols
@@ -914,6 +926,8 @@ SANITIZE_PERSONAL_DATA() {
 		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
 		 AND t.TABLE_NAME = c.TABLE_NAME
 		WHERE c.TABLE_SCHEMA IN (${PII_SANI_SCHEMAS})
+		  AND ( '${SANI_TARGET_SCHEMA:-}' = '' OR
+		        (c.TABLE_SCHEMA='${SANI_TARGET_SCHEMA:-}' AND c.TABLE_NAME='${SANI_TARGET_TABLE:-}') )
 		  AND t.TABLE_TYPE = 'BASE TABLE'
 		  AND c.DATA_TYPE IN ('varchar','char','text','tinytext','mediumtext','longtext')
 		  AND (
@@ -963,6 +977,8 @@ SANITIZE_PERSONAL_DATA() {
 		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
 		 AND t.TABLE_NAME = c.TABLE_NAME
 		WHERE c.TABLE_SCHEMA IN (${PII_SANI_SCHEMAS})
+		  AND ( '${SANI_TARGET_SCHEMA:-}' = '' OR
+		        (c.TABLE_SCHEMA='${SANI_TARGET_SCHEMA:-}' AND c.TABLE_NAME='${SANI_TARGET_TABLE:-}') )
 		  AND t.TABLE_TYPE = 'BASE TABLE'
 		  AND (
 			LOWER(c.COLUMN_NAME) LIKE '%phone%'
@@ -1027,7 +1043,7 @@ SANITIZE_PERSONAL_DATA() {
 	return 0
 }
 
-SANITIZE_PASSWORDS() {
+SANITIZE_PASSWORDS_ONE_TABLE() {
 	log "Sanitizing password columns with the configured fixed value..."
 
 	if [ -z "${PASSWORD_SANI_VALUE}" ]; then
@@ -1061,6 +1077,8 @@ SANITIZE_PASSWORDS() {
 		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
 		 AND t.TABLE_NAME = c.TABLE_NAME
 		WHERE c.TABLE_SCHEMA IN (${PASSWORD_SANI_SCHEMAS})
+		  AND ( '${SANI_TARGET_SCHEMA:-}' = '' OR
+		        (c.TABLE_SCHEMA='${SANI_TARGET_SCHEMA:-}' AND c.TABLE_NAME='${SANI_TARGET_TABLE:-}') )
 		  AND t.TABLE_TYPE = 'BASE TABLE'
 		  AND c.DATA_TYPE IN ('varchar','char','text','tinytext','mediumtext','longtext')
 		  AND (
@@ -1434,6 +1452,10 @@ SANITIZE_EMAIL_COLUMN_IN_KEY_RANGES() {
 		return $?
 	fi
 	local valid ranges worker lower upper extra pid rc=0 worker_log worker_error
+	local worker_numbers="SELECT 0 n" i
+	for ((i=1; i<EMAIL_SANI_MAX_PAR; i++)); do
+		worker_numbers+=" UNION ALL SELECT ${i}"
+	done
 	# The parallel partition is specifically on the immutable single-column id PK.
 	valid=$(mysql -h"${HOST}" -u"${MYSQL_ROOT_USER}" -p"${MYSQL_ROOT_PASS}" -N -B -e "
 		SELECT COUNT(*) FROM information_schema.STATISTICS s
@@ -1447,19 +1469,19 @@ SANITIZE_EMAIL_COLUMN_IN_KEY_RANGES() {
 		 WHERE x.TABLE_SCHEMA=s.TABLE_SCHEMA AND x.TABLE_NAME=s.TABLE_NAME
 		 AND x.INDEX_NAME='PRIMARY' AND x.SEQ_IN_INDEX>1);
 	" 2>>"$Logfile") || return 1
-	if [ "${valid}" != "1" ] || [ "${EMAIL_SANI_MAX_PAR}" != "4" ]; then
-		ERRORmsg "Parallel aperture requires an InnoDB single-column integer id PRIMARY KEY and EMAIL_SANI_MAX_PAR=4"
+	if [ "${valid}" != "1" ]; then
+		ERRORmsg "Parallel aperture requires an InnoDB single-column integer id PRIMARY KEY"
 		return 1
 	fi
 	# DECIMAL arithmetic avoids signed Bash/BIGINT overflow, including MAX(id)+1.
 	# Equal-width half-open ranges cover the entire captured ID span without overlap.
 	ranges=$(mysql -h"${HOST}" -u"${MYSQL_ROOT_USER}" -p"${MYSQL_ROOT_PASS}" -N -B -e "
 		SELECT n+1,
-		 CAST(lo+FLOOR((hi-lo+1)*n/4) AS DECIMAL(65,0)),
-		 CAST(lo+FLOOR((hi-lo+1)*(n+1)/4) AS DECIMAL(65,0))
+		 CAST(lo+FLOOR((hi-lo+1)*n/${EMAIL_SANI_MAX_PAR}) AS DECIMAL(65,0)),
+		 CAST(lo+FLOOR((hi-lo+1)*(n+1)/${EMAIL_SANI_MAX_PAR}) AS DECIMAL(65,0))
 		FROM (SELECT CAST(MIN(id) AS DECIMAL(65,0)) lo,
 		 CAST(MAX(id) AS DECIMAL(65,0)) hi FROM fd_lms.aperture_email_log) b
-		CROSS JOIN (SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) w
+		CROSS JOIN (${worker_numbers}) w
 		WHERE lo IS NOT NULL ORDER BY n;
 	" 2>>"$Logfile") || return 1
 	if [ -z "${ranges}" ]; then
@@ -1478,24 +1500,25 @@ SANITIZE_EMAIL_COLUMN_IN_KEY_RANGES() {
 		fi
 		previous_upper="${upper}"
 	done <<< "${ranges}"
-	[ "${count}" -eq 4 ] || return 1
+	[ "${count}" -eq "${EMAIL_SANI_MAX_PAR}" ] || return 1
 	EMAIL_WORKER_PIDS=()
-	log "Starting four aperture workers; no concurrent application writes are permitted."
+	log "Starting ${EMAIL_SANI_MAX_PAR} aperture workers; no concurrent application writes are permitted."
 	while IFS=$'\t' read -r worker lower upper; do
-		worker_log="${LOG_DIR}/${filename}_worker_${worker}.log"
-		worker_error="${LOG_DIR}/${filename}_worker_${worker}_errors.log"
+		worker_log="${Logfile}"
+		worker_error="${Logfile}"
 		log "Worker ${worker}: id >= ${lower} AND id < ${upper}; log=${worker_log}"
 		(
 			# Only the parent owns cleanup. On a signal it waits for these workers.
 			trap - EXIT
 			trap '' INT TERM HUP
+			SANI_LOG_CONTEXT="aperture-worker-${worker}"
 			Logfile="${worker_log}"
 			ERROR_LOG="${worker_error}"
 			SANITIZE_EMAIL_RANGE_WORKER "$1" "$2" "$3" "${lower}" "${upper}"
 		) >/dev/null 2>>"${worker_error}" &
 		EMAIL_WORKER_PIDS+=("$!")
 	done <<< "${ranges}"
-	for pid in "${EMAIL_WORKER_PIDS[@]}"; do
+	for pid in ${EMAIL_WORKER_PIDS[@]+"${EMAIL_WORKER_PIDS[@]}"}; do
 		if wait "${pid}"; then
 			log "Aperture worker PID ${pid} succeeded."
 		else
@@ -1747,7 +1770,7 @@ SANITIZE_EMAIL_RANGE_WORKER() {
 	return 0
 }
 
-SANITIZE_EMAILS() {
+SANITIZE_EMAILS_ONE_TABLE() {
 	log "Sanitizing email columns across BASE TABLES only..."
 
 	local cols
@@ -1758,11 +1781,16 @@ SANITIZE_EMAILS() {
 		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
 		 AND t.TABLE_NAME = c.TABLE_NAME
 		WHERE c.TABLE_SCHEMA IN (${EMAIL_SANI_SCHEMAS})
+		  AND ( '${SANI_TARGET_SCHEMA:-}' = '' OR
+		        (c.TABLE_SCHEMA='${SANI_TARGET_SCHEMA:-}' AND c.TABLE_NAME='${SANI_TARGET_TABLE:-}') )
 		  AND t.TABLE_TYPE = 'BASE TABLE'
 		  AND c.COLUMN_NAME LIKE '%email%'
 		  AND c.COLUMN_NAME NOT IN ('newemail')
 		  AND c.DATA_TYPE IN ('varchar','char','text','tinytext','mediumtext','longtext');
-	" 2>>"$Logfile")
+	" 2>>"$Logfile") || {
+		ERRORmsg "Failed to discover email columns"
+		return 1
+	}
 
 	if [ -z "$cols" ]; then
 		log "No email columns found."
@@ -1863,6 +1891,173 @@ SANITIZE_EMAILS() {
 
 	log "Sanitizing email columns DONE"
 	return 0
+}
+
+# Drain a bounded batch of independent table jobs before the next phase/DDL.
+WAIT_FOR_TABLE_WORKERS() {
+	local pid failed=0
+	for pid in ${TABLE_WORKER_PIDS[@]+"${TABLE_WORKER_PIDS[@]}"}; do
+		if ! wait "${pid}"; then
+			ERRORmsg "Table worker PID ${pid} failed; inspect its table log."
+			failed=1
+		fi
+	done
+	TABLE_WORKER_PIDS=()
+	return "${failed}"
+}
+
+RUN_TABLE_SANITIZATION_PHASE() {
+	local phase="$1" function_name="$2" query="$3"
+	local tables schema table extra worker_log worker_error fail=0 aperture=0
+	# Use the original column-discovery predicates, then deduplicate table names.
+	tables=$(mysql -h"${HOST}" -u"${MYSQL_ROOT_USER}" -p"${MYSQL_ROOT_PASS}" -N -B -e "${query}" 2>>"$Logfile") || {
+		ERRORmsg "Could not discover tables for ${phase}"
+		return 1
+	}
+	if [ -z "${tables}" ]; then
+		log "No eligible tables for ${phase}."
+		return 0
+	fi
+	tables=$(printf '%s\n' "${tables}" | LC_ALL=C sort -u) || return 1
+	# Reject unsupported identifiers before starting any worker.
+	while IFS=$'\t' read -r schema table extra; do
+		if [[ ! "${schema}" =~ ^[A-Za-z0-9_-]+$ || ! "${table}" =~ ^[A-Za-z0-9_-]+$ ]] || [ -n "${extra}" ]; then
+			ERRORmsg "Unsupported table identifier in ${phase} discovery: ${schema}.${table}"
+			return 1
+		fi
+	done <<< "${tables}"
+	TABLE_WORKER_PIDS=()
+	log "Starting ${phase}: up to ${SANITIZE_MAX_PAR} independent tables at a time."
+	while IFS=$'\t' read -r schema table; do
+		if [ "${phase}" = "email" ] && [ "${schema}.${table}" = "fd_lms.aperture_email_log" ]; then
+			aperture=1
+			continue
+		fi
+		worker_log="${Logfile}"
+		worker_error="${Logfile}"
+		log "Starting ${phase} table ${schema}.${table}; log=${worker_log}"
+		(
+			trap - EXIT
+			trap '' INT TERM HUP
+			SANI_LOG_CONTEXT="${phase}:${schema}.${table}"
+			Logfile="${worker_log}"
+			ERROR_LOG="${worker_error}"
+			SANI_TARGET_SCHEMA="${schema}"
+			SANI_TARGET_TABLE="${table}"
+			log "Starting ${phase} table ${schema}.${table}"
+			if "${function_name}"; then
+				log "Completed ${phase} table ${schema}.${table}"
+				exit 0
+			else
+				ERRORmsg "Failed ${phase} table ${schema}.${table}"
+				exit 1
+			fi
+		) >/dev/null 2>>"${worker_error}" &
+		TABLE_WORKER_PIDS+=("$!")
+		if [ "${#TABLE_WORKER_PIDS[@]}" -ge "${SANITIZE_MAX_PAR}" ]; then
+			WAIT_FOR_TABLE_WORKERS || fail=1
+		fi
+	done <<< "${tables}"
+	WAIT_FOR_TABLE_WORKERS || fail=1
+	# Run aperture in the parent with the whole worker budget. The parent alone
+	# owns its index state and cleanup; no nested N-by-N worker explosion.
+	if [ "${aperture}" -eq 1 ]; then
+		log "Independent email table workers drained; starting aperture range workers."
+		local SANI_TARGET_SCHEMA=fd_lms SANI_TARGET_TABLE=aperture_email_log
+		"${function_name}" || fail=1
+	fi
+	return "${fail}"
+}
+
+SANITIZE_EMAILS() {
+	RUN_TABLE_SANITIZATION_PHASE email SANITIZE_EMAILS_ONE_TABLE "
+SELECT DISTINCT c.TABLE_SCHEMA, c.TABLE_NAME
+		FROM information_schema.COLUMNS c
+		JOIN information_schema.TABLES t
+		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+		 AND t.TABLE_NAME = c.TABLE_NAME
+		WHERE c.TABLE_SCHEMA IN (${EMAIL_SANI_SCHEMAS})
+		  AND t.TABLE_TYPE = 'BASE TABLE'
+		  AND c.COLUMN_NAME LIKE '%email%'
+		  AND c.COLUMN_NAME NOT IN ('newemail')
+		  AND c.DATA_TYPE IN ('varchar','char','text','tinytext','mediumtext','longtext');
+
+	"
+}
+
+SANITIZE_PERSONAL_DATA() {
+	RUN_TABLE_SANITIZATION_PHASE pii SANITIZE_PERSONAL_DATA_ONE_TABLE "
+SELECT DISTINCT c.TABLE_SCHEMA, c.TABLE_NAME
+		FROM information_schema.COLUMNS c
+		JOIN information_schema.TABLES t
+		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+		 AND t.TABLE_NAME = c.TABLE_NAME
+		WHERE c.TABLE_SCHEMA IN (${PII_SANI_SCHEMAS})
+		  AND t.TABLE_TYPE = 'BASE TABLE'
+		  AND c.DATA_TYPE IN ('varchar','char','text','tinytext','mediumtext','longtext')
+		  AND (
+			LOWER(c.COLUMN_NAME) IN (
+				'first_name','firstname','first-name','fname','given_name','givenname',
+				'last_name','lastname','last-name','lname','surname','family_name','familyname'
+			)
+			OR (
+				LOWER(c.COLUMN_NAME) LIKE '%address%'
+				AND LOWER(c.COLUMN_NAME) NOT LIKE '%email%'
+				AND LOWER(c.COLUMN_NAME) NOT LIKE '%address_format%'
+				AND LOWER(c.COLUMN_NAME) NOT IN (
+					'ip_address','ipaddress','mac_address','macaddress',
+					'web_address','url_address','wallet_address'
+				)
+			)
+		  );
+
+SELECT DISTINCT c.TABLE_SCHEMA, c.TABLE_NAME
+		FROM information_schema.COLUMNS c
+		JOIN information_schema.TABLES t
+		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+		 AND t.TABLE_NAME = c.TABLE_NAME
+		WHERE c.TABLE_SCHEMA IN (${PII_SANI_SCHEMAS})
+		  AND t.TABLE_TYPE = 'BASE TABLE'
+		  AND (
+			LOWER(c.COLUMN_NAME) LIKE '%phone%'
+			OR LOWER(c.COLUMN_NAME) LIKE '%telephone%'
+			OR LOWER(c.COLUMN_NAME) IN (
+				'mobile','mobile_number','mobilenumber',
+				'cell','cell_number','cellnumber'
+			)
+		  )
+		  AND LOWER(c.COLUMN_NAME) NOT LIKE '%phone_verified%'
+		  AND LOWER(c.COLUMN_NAME) NOT LIKE '%phone_enabled%'
+		  AND LOWER(c.COLUMN_NAME) NOT LIKE '%phonetic%'
+		  AND LOWER(c.COLUMN_NAME) NOT IN ('phonecode','phone_code','telephone_code')
+		  AND c.DATA_TYPE IN (
+			'varchar','char','text','tinytext','mediumtext','longtext',
+			'tinyint','smallint','mediumint','int','integer','bigint','decimal','numeric'
+		  );
+
+	"
+}
+
+SANITIZE_PASSWORDS() {
+	RUN_TABLE_SANITIZATION_PHASE password SANITIZE_PASSWORDS_ONE_TABLE "
+SELECT DISTINCT c.TABLE_SCHEMA, c.TABLE_NAME
+		FROM information_schema.COLUMNS c
+		JOIN information_schema.TABLES t
+		  ON t.TABLE_SCHEMA = c.TABLE_SCHEMA
+		 AND t.TABLE_NAME = c.TABLE_NAME
+		WHERE c.TABLE_SCHEMA IN (${PASSWORD_SANI_SCHEMAS})
+		  AND t.TABLE_TYPE = 'BASE TABLE'
+		  AND c.DATA_TYPE IN ('varchar','char','text','tinytext','mediumtext','longtext')
+		  AND (
+			LOWER(c.COLUMN_NAME) REGEXP '(^|_)(password|passwd|pwd|passphrase)(_hash|_value|_encrypted|_digest)?$'
+			OR LOWER(c.COLUMN_NAME) IN (
+				'userpassword','loginpassword','dbpassword','ftppassword',
+				'passwordhash','passwordvalue','newpassword','oldpassword'
+			)
+		  )
+		;
+
+	"
 }
 
 CLEANUP_SANITIZE_DATA() {
@@ -2142,7 +2337,7 @@ EXPORT_MYSQL_FULL_DUMP() {
 		--backup \
 		--datadir="${MYSQL_DATA_DIR}/" \
 		--target-dir="${SANI_DUMP_DIR}/" \
-		2>&1 | tee "${XTRABACKUP_BACKUP_LOG}"
+		2>&1 | tee -a "${XTRABACKUP_BACKUP_LOG}"
 
 	if [ "${PIPESTATUS[0]}" -ne 0 ]; then
 		ERRORmsg "xtrabackup backup failed. Check ${XTRABACKUP_BACKUP_LOG}"
@@ -2159,7 +2354,7 @@ EXPORT_MYSQL_FULL_DUMP() {
 	xtrabackup \
 		--prepare \
 		--target-dir="${SANI_DUMP_DIR}" \
-		2>&1 | tee "${XTRABACKUP_PREPARE_LOG}"
+		2>&1 | tee -a "${XTRABACKUP_PREPARE_LOG}"
 
 	if [ "${PIPESTATUS[0]}" -ne 0 ]; then
 		ERRORmsg "xtrabackup prepare failed. Check ${XTRABACKUP_PREPARE_LOG}"
@@ -2246,7 +2441,7 @@ if [ "${RUN_MODE}" != "full" ]; then
 	echo "$(date) - ${RUN_MODE} diagnostic log started" >> "$ERROR_LOG"
 else
 	echo "$(date) - Started" | tee "$Logfile"
-	echo "$(date) - Diagnostic log started" > "$ERROR_LOG"
+	echo "$(date) - Diagnostic log started" >> "$ERROR_LOG"
 fi
 
 mkdir -p "${DESTINATION}"
