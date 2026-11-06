@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # ── Settings ──────────────────────────────────────────────────────
-BACKUP_DIR="/mongo/dump_mongodb"
-DATA_DIR="/var/lib/mongodb"
+BACKUP_DIR="/root/mongo5backup"
+DATA_DIR="/opt/mongodb"
 LOG_FILE="/var/log/mongodb/mongod.log"
 
 SERVICE_NAME="mongod"
@@ -18,6 +18,8 @@ MONGO_PORT="27017"
   echo "Run this script as root."
   exit 1
 }
+
+
 
 for cmd in rsync systemctl "$MONGO_SHELL"; do
   command -v "$cmd" >/dev/null || {
@@ -97,5 +99,5 @@ localDB.oplog.rs.drop();
 print("Replica configurations remaining: " +
       localDB.system.replset.find().count());
 MONGO
-
+rm -f -- /root/gagan/mongo_sanitize.resume
 echo "Restore and replica metadata cleanup completed."
