@@ -6,20 +6,20 @@ SANITIZE_MAX_PAR=8
 
 export PATH=/usr/lib/jvm/jdk-21.0.7-oracle-x64/bin/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-MYSQL_DATA_DIR=/var/lib/mysql/alertdriving
+MYSQL_DATA_DIR=/var/lib/mysql
 MYSQL_USER=mysql
 MYSQL_GROUP=mysql
 MYSQLD_SAFE=/usr/bin/mysqld_safe
 MYSQL_INIT_SCRIPT=/etc/init.d/mysql
 
-SOURCE_DUMP_DIR=/opt/data/mysql/backup
+SOURCE_DUMP_DIR=/opt/mysql-dump
 
-SANI_DUMP_DIR=/opt/mysql_full_dump_sanitized
-SANI_DUMP_TGZ=/opt/mysql_full_dump_sanitized.tgz
-SANI_DUMP_OLD_TAR=/opt/mysql_full_dump_sanitized.tar
-SANI_DUMP_OLD_TAR_GZ=/opt/mysql_full_dump_sanitized.tar.gz
+SANI_DUMP_DIR=/root/gagan/mysql_full_dump_sanitized
+SANI_DUMP_TGZ=/root/gagan/mysql_full_dump_sanitized.tgz
+SANI_DUMP_OLD_TAR=/root/gagan/mysql_full_dump_sanitized.tar
+SANI_DUMP_OLD_TAR_GZ=/root/gagan/mysql_full_dump_sanitized.tar.gz
 
-DESTINATION=/opt/data_dump_files_after_sanitization
+DESTINATION=/root/gagan/data_dump_files_after_sanitization
 STRUCTURES_SQL=${DESTINATION}/database_structures.sql
 TRIGGERS_SQL=${DESTINATION}/database_triggers.sql
 USERS_PERMS_SQL=${DESTINATION}/database_users_permissions.sql
@@ -32,8 +32,8 @@ ERROR_LOG="${Logfile}"
 XTRABACKUP_BACKUP_LOG="${Logfile}"
 XTRABACKUP_PREPARE_LOG="${Logfile}"
 
-MD5_TMP=/opt/mysql-files-md5.txt
-MD5_TMP_CLEANED=/opt/mysql-files-md5_paths_removed.txt
+MD5_TMP=/root/gagan/mysql-files-md5.txt
+MD5_TMP_CLEANED=/root/gagan/mysql-files-md5_paths_removed.txt
 MD5_FINAL=${SANI_DUMP_DIR}/mysql-files-md5.txt
 
 MOVE_TGZ_TO_SHAREME=0
